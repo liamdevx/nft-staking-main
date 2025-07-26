@@ -1,0 +1,22 @@
+# file: Anchor.toml
+
+[toolchain]
+# These versions are tested and known to be compatible with each other.
+anchor_version = "0.31.1"
+
+[features]
+skip-lint = false
+
+[programs.devnet]
+# After the first successful build, replace this with your new Program ID
+multi_nft_staker = "3y342gXhWDp5Kcs4UFyna8rUBGeCQrzLq8Vn69Vtk5Bs"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Devnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"

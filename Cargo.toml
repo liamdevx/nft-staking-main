@@ -1,0 +1,18 @@
+# file: <your-project-name>/Cargo.toml (the ROOT one)
+
+[workspace]
+resolver = "2"
+members = [
+    "programs/*"
+]
+
+[workspace.dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = "0.31.1"
+# Use the exact version from your Cargo.toml
+mpl-token-metadata = { version = "5.1.0" }
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
