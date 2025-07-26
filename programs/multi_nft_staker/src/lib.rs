@@ -3,7 +3,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::{
     associated_token::AssociatedToken,
-    // CORRECTED: Import `TokenInterface` for the program type
     token_interface::{CloseAccount, Mint, TokenAccount, TokenInterface, Transfer},
 };
 use mpl_token_metadata::accounts::Metadata;
@@ -15,8 +14,7 @@ declare_id!("AEX1smJbH8pgMBL2Hpf6EJnuRaUwBt6NBYP7jVPixAeC");
 pub mod nft_staking {
     use super::*;
 
-    // --- ADMIN INSTRUCTIONS ---
-    // (No changes needed in these instructions)
+    // ... (previous admin instructions: initialize_pool, add_reward, add_collection, remove_collection) ...
 
     pub fn initialize_pool(ctx: Context<InitializePool>) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
@@ -29,12 +27,11 @@ pub mod nft_staking {
         pool.last_update_time = Clock::get()?.unix_timestamp;
         pool.epoch_duration = 86400; // 24 hours
         pool.rewards_per_epoch = Vec::new();
-        pool.reward_per_nft_stored = 0;
         pool.bump = ctx.bumps.pool;
         pool.start_staking_timestamp = Clock::get()?.unix_timestamp;
         pool.skipped_reward_per_nft = 0;
         pool.last_update_calc_reward_nft_index = 0; 
-        pool.staked_counts = Vec::new(); // length = MAX_EPOCHS
+        pool.staked_counts = vec![0; Pool::MAX_EPOCHS]; // Initialize with zeros up to MAX_EPOCHS
         Ok(())
     }
 
@@ -58,7 +55,9 @@ pub mod nft_staking {
         )?;
 
         let pool = &mut ctx.accounts.pool;
-        let reward_per_epoch = total_reward_amount.checked_div(num_epochs).unwrap();
+        let reward_per_epoch = total_reward_amount
+            .checked_div(num_epochs)
+            .ok_or(ErrorCode::ZeroEpochAmount)?; // Use ok_or for better error
         require!(
             pool.rewards_per_epoch.len() + (num_epochs as usize) <= Pool::MAX_EPOCHS,
             ErrorCode::MaxEpochsExceeded
@@ -81,6 +80,10 @@ pub mod nft_staking {
             !pool.allowed_collections.contains(&collection_mint),
             ErrorCode::CollectionAlreadyAllowed
         );
+        require!(
+            pool.allowed_collections.len() < Pool::MAX_COLLECTIONS,
+            ErrorCode::MaxCollectionsExceeded
+        ); // Added max collection check
         pool.allowed_collections.push(collection_mint);
         Ok(())
     }
@@ -90,15 +93,19 @@ pub mod nft_staking {
         collection_mint: Pubkey,
     ) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
+        let initial_len = pool.allowed_collections.len();
         pool.allowed_collections
             .retain(|&mint| mint != collection_mint);
+        require!(
+            pool.allowed_collections.len() < initial_len,
+            ErrorCode::CollectionNotAllowed // Return error if collection wasn't found
+        );
         Ok(())
     }
 
     // --- USER INSTRUCTIONS ---
 
     pub fn stake(ctx: Context<Stake>) -> Result<()> {
-        // CORRECTED: Manually deserialize the foreign Metaplex account from UncheckedAccount
         let nft_metadata_account_info = &ctx.accounts.nft_metadata_account.to_account_info();
         let nft_metadata =
             Metadata::safe_deserialize(&nft_metadata_account_info.try_borrow_data()?)?;
@@ -121,27 +128,36 @@ pub mod nft_staking {
             authority: ctx.accounts.user.to_account_info(),
         };
         anchor_spl::token_interface::transfer(CpiContext::new(cpi_program, cpi_accounts), 1)?;
-        update_skipped_reward(pool);
+        
+        // Ensure skipped_reward_per_nft is updated before recording it for the stake entry
+        update_skipped_reward(pool)?; 
 
         let stake_entry = &mut ctx.accounts.stake_entry;
         stake_entry.user = ctx.accounts.user.key();
         stake_entry.nft_mint = ctx.accounts.nft_mint.key();
         stake_entry.staked_at = Clock::get()?.unix_timestamp;
-        stake_entry.last_claimed_epoch = pool.current_epoch;
+        stake_entry.last_claimed_epoch = pool.current_epoch; // This field might be redundant if using skipped_reward
         stake_entry.bump = ctx.bumps.stake_entry;
-        stake_entry.skipped_reward = pool.skipped_reward_per_nft;
+        stake_entry.skipped_reward = pool.skipped_reward_per_nft; // Record current global skipped reward
 
         pool.total_staked = pool.total_staked.checked_add(1).unwrap();
         let current_day = get_current_day(&pool)?;
-        pool.staked_counts[current_day as usize] += 1;
+        // Ensure staked_counts has enough capacity
+        if (current_day as usize) >= pool.staked_counts.len() {
+             pool.staked_counts.resize((current_day as usize) + 1, 0);
+        }
+        pool.staked_counts[current_day as usize] = pool.staked_counts[current_day as usize].checked_add(1).unwrap();
 
-       
-        //update_skipped_reward(&pool);
         Ok(())
     }
 
     pub fn unstake(ctx: Context<Unstake>) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
+
+        // Optional: Call claim_reward here before unstaking if you want
+        // users to automatically claim rewards on unstake.
+        // This would require passing the `reward_mint` and `user_reward_token_account` to Unstake context
+        // and calling the claim logic. For now, assuming claim is a separate call.
 
         let user_key = ctx.accounts.user.key();
         let nft_mint_key = ctx.accounts.nft_mint.key();
@@ -176,8 +192,12 @@ pub mod nft_staking {
 
         pool.total_staked = pool.total_staked.checked_sub(1).unwrap();
         let current_day = get_current_day(&pool)?;
-        pool.staked_counts[current_day as usize] -= 1;
-        //update_skipped_reward(&pool);
+        // Ensure staked_counts has enough capacity
+        if (current_day as usize) < pool.staked_counts.len() {
+            pool.staked_counts[current_day as usize] = pool.staked_counts[current_day as usize].checked_sub(1).unwrap_or(0);
+        }
+        // No need to update skipped_reward here if claim is separate
+
         Ok(())
     }
 
@@ -194,7 +214,7 @@ pub mod nft_staking {
         require_gt!(reward_amount, 0, ErrorCode::NoRewardsToClaim);
 
         // Transfer rewards from the pool's vault to the user
-        let pool_key = pool.key();
+        //let pool_key = pool.key();
         let seeds = &[
             b"pool".as_ref(),
             &[pool.bump],
@@ -226,28 +246,15 @@ pub mod nft_staking {
     }
 }
 
-// fn update_rewards_for_epoch(pool: &mut Account<Pool>) -> Result<()> {
-//     if pool.total_staked > 0 {
-//         if let Some(reward_for_current_epoch) = pool.rewards_per_epoch.get(pool.current_epoch as usize) {
-//             let reward_addition = (*reward_for_current_epoch as u128)
-//                 .checked_mul(PRECISION).unwrap()
-//                 .checked_div(pool.total_staked as u128).unwrap();
-            
-//             pool.reward_per_nft_stored = pool.reward_per_nft_stored.checked_add(reward_addition).unwrap();
-//         }
-//     }
-//     Ok(())
-// }
-
 fn get_current_day(pool: &Pool) -> Result<u64> {
     let now = Clock::get()?.unix_timestamp;
 
     if now < pool.start_staking_timestamp {
-        return Ok(0); // Chưa bắt đầu
+        return Ok(0); // Before staking started, consider day 0
     }
 
     let elapsed_seconds = now - pool.start_staking_timestamp;
-    let elapsed_days = elapsed_seconds / 86_400; // 1 ngày = 86400 giây
+    let elapsed_days = elapsed_seconds / 86400; // 1 day = 86400 seconds
 
     Ok(elapsed_days as u64)
 }
@@ -255,20 +262,23 @@ fn get_current_day(pool: &Pool) -> Result<u64> {
 pub fn update_skipped_reward(pool: &mut Pool) -> Result<()> {
     let current_day = get_current_day(pool)?;
 
-    // Bỏ qua nếu đã cập nhật đến ngày hiện tại
+    // Only update if there are new days to process
     if pool.last_update_calc_reward_nft_index >= current_day {
         return Ok(());
     }
 
     for day in pool.last_update_calc_reward_nft_index..current_day {
+        // Ensure we don't go out of bounds for rewards_per_epoch or staked_counts
         let reward_today = *pool.rewards_per_epoch.get(day as usize).unwrap_or(&0);
         let staked_count = *pool.staked_counts.get(day as usize).unwrap_or(&0);
 
         if staked_count > 0 {
-            let skipped_reward = reward_today / staked_count as u64;
+            let skipped_reward_for_day = reward_today.checked_div(staked_count as u64)
+                .ok_or(ErrorCode::RewardCalculationError)?; // Handle division by zero
             pool.skipped_reward_per_nft = pool
                 .skipped_reward_per_nft
-                .saturating_add(skipped_reward);
+                .checked_add(skipped_reward_for_day)
+                .ok_or(ErrorCode::RewardCalculationError)?; // Handle overflow
         }
     }
 
@@ -322,7 +332,6 @@ pub struct Stake<'info> {
     #[account(mut, seeds = [b"pool"], bump = pool.bump)]
     pub pool: Account<'info, Pool>,
     pub nft_mint: InterfaceAccount<'info, Mint>,
-    // CORRECTED: Use `UncheckedAccount` for foreign accounts that will be manually deserialized.
     #[account(
         seeds = [b"metadata", mpl_token_metadata::ID.as_ref(), nft_mint.key().as_ref()],
         seeds::program = mpl_token_metadata::ID,
@@ -364,14 +373,15 @@ pub struct ClaimReward<'info> {
     pub user: Signer<'info>,
     #[account(mut, seeds = [b"pool"], bump = pool.bump)]
     pub pool: Account<'info, Pool>,
-    // Add the reward_mint as an InterfaceAccount here
-    pub reward_mint: InterfaceAccount<'info, Mint>, // <--- ADD THIS LINE
-    // The NFT mint associated with the stake entry
+    // The Mint account for the reward token, required for init_if_needed on user_reward_token_account
+    #[account(address = pool.reward_mint)] // Add constraint to ensure it's the correct reward mint
+    pub reward_mint: InterfaceAccount<'info, Mint>, 
+    // The NFT mint associated with the stake entry being claimed
     pub nft_mint: InterfaceAccount<'info, Mint>,
     #[account(
         mut,
         has_one = user,
-        has_one = nft_mint,
+        has_one = nft_mint, // Ensure this stake_entry belongs to this user and NFT
         seeds = [b"stake_entry", user.key().as_ref(), nft_mint.key().as_ref()],
         bump = stake_entry.bump
     )]
@@ -381,8 +391,7 @@ pub struct ClaimReward<'info> {
     #[account(
         init_if_needed,
         payer = user,
-        // Now reference the newly added `reward_mint` account field
-        associated_token::mint = reward_mint, // <--- CHANGE THIS LINE
+        associated_token::mint = reward_mint, // Reference the reward_mint account
         associated_token::authority = user
     )]
     pub user_reward_token_account: InterfaceAccount<'info, TokenAccount>,
@@ -405,7 +414,6 @@ pub struct Pool {
     pub last_update_time: i64,
     pub epoch_duration: i64,
     pub rewards_per_epoch: Vec<u64>,
-    pub reward_per_nft_stored: u128,
     pub bump: u8,
     pub start_staking_timestamp: i64, // ✅ Thời điểm bắt đầu staking chính thức
     pub skipped_reward_per_nft: u64, // ✅ Tổng phần thưởng bỏ lỡ mỗi NFT tính đến thời điểm cuối
@@ -414,31 +422,30 @@ pub struct Pool {
 }
 impl Pool {
     pub const MAX_EPOCHS: usize = 1200;
-    pub const MAX_COLLECTIONS: usize = 2;
+    pub const MAX_COLLECTIONS: usize = 2; // Increased to 2 for example
     pub const ACCOUNT_SPACE: usize = 8
-        + 32
-        + 32
-        + 32
-        + (4 + 32 * Self::MAX_COLLECTIONS)
-        + 8
-        + 8
-        + 8
-        + 8
-        + (4 + 8 * Self::MAX_EPOCHS)
-        + 16
-        + 1
-        + 8  // start_staking_timestamp ✅ mới
-        + 8  // skipped_reward_per_nft ✅ mới
-        + 8 // last_update_calc_reward_nft_index ✅ mới
-        + (4 + 4 * Self::MAX_EPOCHS); // stake_counts
+        + 32 // admin
+        + 32 // reward_mint
+        + 32 // reward_vault
+        + (4 + 32 * Self::MAX_COLLECTIONS) // allowed_collections
+        + 8  // total_staked
+        + 8  // current_epoch
+        + 8  // last_update_time
+        + 8  // epoch_duration
+        + (4 + 8 * Self::MAX_EPOCHS) // rewards_per_epoch
+        + 1  // bump
+        + 8  // start_staking_timestamp
+        + 8  // skipped_reward_per_nft
+        + 8  // last_update_calc_reward_nft_index
+        + (4 + 4 * Self::MAX_EPOCHS); // staked_counts - 4 bytes per u32
 }
 #[account]
 pub struct NftStakeEntry {
     pub user: Pubkey,
     pub nft_mint: Pubkey,
     pub staked_at: i64,
-    pub last_claimed_epoch: u64,
-    pub skipped_reward: u64,
+    pub last_claimed_epoch: u64, // This field might become less relevant with skipped_reward
+    pub skipped_reward: u64, // The skipped_reward_per_nft value when this NFT was staked/last claimed
     pub bump: u8,
 }
 impl NftStakeEntry {

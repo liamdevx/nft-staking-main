@@ -31,10 +31,6 @@ pub mod nft_staking {
         pool.rewards_per_epoch = Vec::new();
         pool.reward_per_nft_stored = 0;
         pool.bump = ctx.bumps.pool;
-        pool.start_staking_timestamp = Clock::get()?.unix_timestamp;
-        pool.skipped_reward_per_nft = 0;
-        pool.last_update_calc_reward_nft_index = 0; 
-        pool.staked_counts = Vec::new(); // length = MAX_EPOCHS
         Ok(())
     }
 
@@ -121,7 +117,9 @@ pub mod nft_staking {
             authority: ctx.accounts.user.to_account_info(),
         };
         anchor_spl::token_interface::transfer(CpiContext::new(cpi_program, cpi_accounts), 1)?;
-        update_skipped_reward(pool);
+
+        /// correct reward_per_nft_stored in pool PDA
+    
 
         let stake_entry = &mut ctx.accounts.stake_entry;
         stake_entry.user = ctx.accounts.user.key();
@@ -129,14 +127,8 @@ pub mod nft_staking {
         stake_entry.staked_at = Clock::get()?.unix_timestamp;
         stake_entry.last_claimed_epoch = pool.current_epoch;
         stake_entry.bump = ctx.bumps.stake_entry;
-        stake_entry.skipped_reward = pool.skipped_reward_per_nft;
 
         pool.total_staked = pool.total_staked.checked_add(1).unwrap();
-        let current_day = get_current_day(&pool)?;
-        pool.staked_counts[current_day as usize] += 1;
-
-       
-        //update_skipped_reward(&pool);
         Ok(())
     }
 
@@ -175,64 +167,75 @@ pub mod nft_staking {
         ))?;
 
         pool.total_staked = pool.total_staked.checked_sub(1).unwrap();
-        let current_day = get_current_day(&pool)?;
-        pool.staked_counts[current_day as usize] -= 1;
-        //update_skipped_reward(&pool);
+        Ok(())
+    }
+
+    pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
+        let pool = &mut ctx.accounts.pool;
+        let stake_entry = &mut ctx.accounts.stake_entry;
+
+        let now = Clock::get()?.unix_timestamp;
+        let time_since_last_update = now.saturating_sub(pool.last_update_time);
+        let epochs_passed = time_since_last_update
+            .checked_div(pool.epoch_duration)
+            .unwrap_or(0) as u64;
+
+        if epochs_passed > 0 {
+            pool.current_epoch = pool.current_epoch.saturating_add(epochs_passed);
+            pool.last_update_time = now;
+        }
+
+        let mut total_rewards: u64 = 0;
+        let start_epoch = stake_entry.last_claimed_epoch;
+        let end_epoch = pool.current_epoch;
+
+        if start_epoch < end_epoch {
+            for epoch_index in start_epoch..end_epoch {
+                if let Some(reward_for_epoch) = pool.rewards_per_epoch.get(epoch_index as usize) {
+                    if pool.total_staked > 0 {
+                        let reward_per_nft =
+                            reward_for_epoch.checked_div(pool.total_staked).unwrap_or(0);
+                        total_rewards = total_rewards.checked_add(reward_per_nft).unwrap();
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        require_gt!(total_rewards, 0, ErrorCode::NoRewardsToClaim);
+
+        let seeds = &[b"pool".as_ref(), &[pool.bump]];
+        let signer = &[&seeds[..]];
+
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.reward_vault.to_account_info(),
+            to: ctx.accounts.user_reward_token_account.to_account_info(),
+            authority: pool.to_account_info(),
+        };
+        anchor_spl::token_interface::transfer(
+            CpiContext::new_with_signer(cpi_program, cpi_accounts, signer),
+            total_rewards,
+        )?;
+
+        stake_entry.last_claimed_epoch = end_epoch;
         Ok(())
     }
 }
 
-// fn update_rewards_for_epoch(pool: &mut Account<Pool>) -> Result<()> {
-//     if pool.total_staked > 0 {
-//         if let Some(reward_for_current_epoch) = pool.rewards_per_epoch.get(pool.current_epoch as usize) {
-//             let reward_addition = (*reward_for_current_epoch as u128)
-//                 .checked_mul(PRECISION).unwrap()
-//                 .checked_div(pool.total_staked as u128).unwrap();
+fn update_rewards_for_epoch(pool: &mut Account<Pool>) -> Result<()> {
+    if pool.total_staked > 0 {
+        if let Some(reward_for_current_epoch) = pool.rewards_per_epoch.get(pool.current_epoch as usize) {
+            let reward_addition = (*reward_for_current_epoch as u128)
+                .checked_mul(PRECISION).unwrap()
+                .checked_div(pool.total_staked as u128).unwrap();
             
-//             pool.reward_per_nft_stored = pool.reward_per_nft_stored.checked_add(reward_addition).unwrap();
-//         }
-//     }
-//     Ok(())
-// }
-
-fn get_current_day(pool: &Pool) -> Result<u64> {
-    let now = Clock::get()?.unix_timestamp;
-
-    if now < pool.start_staking_timestamp {
-        return Ok(0); // Chưa bắt đầu
-    }
-
-    let elapsed_seconds = now - pool.start_staking_timestamp;
-    let elapsed_days = elapsed_seconds / 86_400; // 1 ngày = 86400 giây
-
-    Ok(elapsed_days as u64)
-}
-
-pub fn update_skipped_reward(pool: &mut Pool) -> Result<()> {
-    let current_day = get_current_day(pool)?;
-
-    // Bỏ qua nếu đã cập nhật đến ngày hiện tại
-    if pool.last_update_calc_reward_nft_index >= current_day {
-        return Ok(());
-    }
-
-    for day in pool.last_update_calc_reward_nft_index..current_day {
-        let reward_today = *pool.rewards_per_epoch.get(day as usize).unwrap_or(&0);
-        let staked_count = *pool.staked_counts.get(day as usize).unwrap_or(&0);
-
-        if staked_count > 0 {
-            let skipped_reward = reward_today / staked_count as u64;
-            pool.skipped_reward_per_nft = pool
-                .skipped_reward_per_nft
-                .saturating_add(skipped_reward);
+            pool.reward_per_nft_stored = pool.reward_per_nft_stored.checked_add(reward_addition).unwrap();
         }
     }
-
-    pool.last_update_calc_reward_nft_index = current_day;
-
     Ok(())
 }
-
 
 // --- ACCOUNTS ---
 
@@ -314,6 +317,26 @@ pub struct Unstake<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
+#[derive(Accounts)]
+pub struct ClaimRewards<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut, seeds = [b"pool"], bump = pool.bump, has_one = reward_mint)]
+    pub pool: Account<'info, Pool>,
+    #[account(mut, address = pool.reward_vault)]
+    pub reward_vault: InterfaceAccount<'info, TokenAccount>,
+    pub reward_mint: InterfaceAccount<'info, Mint>,
+    #[account(init_if_needed, payer = user, associated_token::mint = reward_mint, associated_token::authority = user)]
+    pub user_reward_token_account: InterfaceAccount<'info, TokenAccount>,
+    #[account(mut, has_one = user, seeds = [b"stake_entry", user.key().as_ref(), nft_mint.key().as_ref()], bump = stake_entry.bump)]
+    pub stake_entry: Account<'info, NftStakeEntry>,
+    /// CHECK: The mint of the NFT being claimed for, used as a seed.
+    pub nft_mint: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
 // --- DATA STRUCTS ---
 
 #[account]
@@ -329,10 +352,6 @@ pub struct Pool {
     pub rewards_per_epoch: Vec<u64>,
     pub reward_per_nft_stored: u128,
     pub bump: u8,
-    pub start_staking_timestamp: i64, // ✅ Thời điểm bắt đầu staking chính thức
-    pub skipped_reward_per_nft: u64, // ✅ Tổng phần thưởng bỏ lỡ mỗi NFT tính đến thời điểm cuối
-    pub last_update_calc_reward_nft_index: u64, // ✅ Ngày cuối cùng đã update skipped reward
-    pub staked_counts: Vec<u32> // nft staking/day
 }
 impl Pool {
     pub const MAX_EPOCHS: usize = 1200;
@@ -348,11 +367,7 @@ impl Pool {
         + 8
         + (4 + 8 * Self::MAX_EPOCHS)
         + 16
-        + 1
-        + 8  // start_staking_timestamp ✅ mới
-        + 8  // skipped_reward_per_nft ✅ mới
-        + 8 // last_update_calc_reward_nft_index ✅ mới
-        + (4 + 4 * Self::MAX_EPOCHS); // stake_counts
+        + 1;
 }
 #[account]
 pub struct NftStakeEntry {
