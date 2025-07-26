@@ -29,7 +29,7 @@ pub mod nft_staking {
         pool.rewards_per_epoch = Vec::new();
         pool.bump = ctx.bumps.pool;
         pool.start_staking_timestamp = Clock::get()?.unix_timestamp;
-        pool.skipped_reward_per_nft = 0;
+        pool.cumulative_reward_per_nft = 0; // Renamed
         pool.last_update_calc_reward_nft_index = 0; 
         pool.staked_counts = vec![0; Pool::MAX_EPOCHS]; // Initialize with zeros up to MAX_EPOCHS
         Ok(())
@@ -175,16 +175,16 @@ pub mod nft_staking {
         };
         anchor_spl::token_interface::transfer(CpiContext::new(cpi_program, cpi_accounts), 1)?;
         
-        // Ensure skipped_reward_per_nft is updated before recording it for the stake entry
+        // Ensure cumulative_reward_per_nft is updated before recording it for the stake entry
         update_skipped_reward(pool)?; 
 
         let stake_entry = &mut ctx.accounts.stake_entry;
         stake_entry.user = ctx.accounts.user.key();
         stake_entry.nft_mint = ctx.accounts.nft_mint.key();
         stake_entry.staked_at = Clock::get()?.unix_timestamp;
-        stake_entry.last_claimed_epoch = pool.current_epoch; // This field might be redundant if using skipped_reward
+        stake_entry.last_claimed_epoch = pool.current_epoch; // This field might be redundant with cumulative_reward
         stake_entry.bump = ctx.bumps.stake_entry;
-        stake_entry.skipped_reward = pool.skipped_reward_per_nft; // Record current global skipped reward
+        stake_entry.skipped_reward = pool.cumulative_reward_per_nft; // Record current global cumulative reward
 
         pool.total_staked = pool.total_staked.checked_add(1).unwrap();
         let current_day = get_current_day(&pool)?;
@@ -194,26 +194,66 @@ pub mod nft_staking {
         }
         pool.staked_counts[current_day as usize] = pool.staked_counts[current_day as usize].checked_add(1).unwrap();
 
+        // Emit StakeEvent
+        emit!(StakeEvent {
+            user: ctx.accounts.user.key(),
+            nft_mint: ctx.accounts.nft_mint.key(),
+            staked_at: stake_entry.staked_at,
+        });
+
         Ok(())
     }
 
     pub fn unstake(ctx: Context<Unstake>) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
+        let stake_entry = &mut ctx.accounts.stake_entry;
 
-        // Optional: Call claim_reward here before unstaking if you want
-        // users to automatically claim rewards on unstake.
-        // This would require passing the `reward_mint` and `user_reward_token_account` to Unstake context
-        // and calling the claim logic. For now, assuming claim is a separate call.
+        // Ensure the pool's cumulative_reward_per_nft is up-to-date before calculating rewards
+        update_skipped_reward(pool)?;
+
+        // Calculate the reward amount: current global cumulative reward - cumulative reward at stake time
+        let reward_amount = pool.cumulative_reward_per_nft.checked_sub(stake_entry.skipped_reward)
+            .ok_or(ErrorCode::RewardCalculationError)?;
+        
+        // Only transfer rewards if there are any
+        if reward_amount > 0 {
+            let pool_seeds = &[
+                b"pool".as_ref(),
+                &[pool.bump],
+            ];
+            let pool_signer = &[&pool_seeds[..]];
+
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_accounts = Transfer {
+                from: ctx.accounts.reward_vault.to_account_info(),
+                to: ctx.accounts.user_reward_token_account.to_account_info(),
+                authority: pool.to_account_info(),
+            };
+            anchor_spl::token_interface::transfer(
+                CpiContext::new_with_signer(cpi_program, cpi_accounts, pool_signer),
+                reward_amount,
+            )?;
+
+            // Update the stake entry's skipped_reward to the current pool's cumulative_reward_per_nft.
+            stake_entry.skipped_reward = pool.cumulative_reward_per_nft;
+
+            emit!(RewardClaimed {
+                user: ctx.accounts.user.key(),
+                nft_mint: stake_entry.nft_mint,
+                amount: reward_amount,
+            });
+        }
+
 
         let user_key = ctx.accounts.user.key();
         let nft_mint_key = ctx.accounts.nft_mint.key();
-        let seeds = &[
+        let stake_entry_seeds = &[
             b"stake_entry".as_ref(),
             user_key.as_ref(),
             nft_mint_key.as_ref(),
             &[ctx.accounts.stake_entry.bump],
         ];
-        let signer = &[&seeds[..]];
+        let stake_entry_signer = &[&stake_entry_seeds[..]];
 
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_accounts_transfer = Transfer {
@@ -222,7 +262,7 @@ pub mod nft_staking {
             authority: ctx.accounts.stake_entry.to_account_info(),
         };
         anchor_spl::token_interface::transfer(
-            CpiContext::new_with_signer(cpi_program.clone(), cpi_accounts_transfer, signer),
+            CpiContext::new_with_signer(cpi_program.clone(), cpi_accounts_transfer, stake_entry_signer),
             1,
         )?;
 
@@ -233,7 +273,7 @@ pub mod nft_staking {
                 destination: ctx.accounts.user.to_account_info(),
                 authority: ctx.accounts.stake_entry.to_account_info(),
             },
-            signer,
+            stake_entry_signer,
         ))?;
 
         pool.total_staked = pool.total_staked.checked_sub(1).unwrap();
@@ -242,7 +282,13 @@ pub mod nft_staking {
         if (current_day as usize) < pool.staked_counts.len() {
             pool.staked_counts[current_day as usize] = pool.staked_counts[current_day as usize].checked_sub(1).unwrap_or(0);
         }
-        // No need to update skipped_reward here if claim is separate
+        
+        // Emit UnstakeEvent
+        emit!(UnstakeEvent {
+            user: ctx.accounts.user.key(),
+            nft_mint: ctx.accounts.nft_mint.key(),
+            unstaked_at: Clock::get()?.unix_timestamp,
+        });
 
         Ok(())
     }
@@ -251,11 +297,11 @@ pub mod nft_staking {
         let pool = &mut ctx.accounts.pool;
         let stake_entry = &mut ctx.accounts.stake_entry;
 
-        // Ensure the pool's skipped_reward_per_nft is up-to-date before calculating rewards
+        // Ensure the pool's cumulative_reward_per_nft is up-to-date before calculating rewards
         update_skipped_reward(pool)?;
 
-        // Calculate the reward amount: current global skipped reward - skipped reward at stake time
-        let reward_amount = pool.skipped_reward_per_nft.checked_sub(stake_entry.skipped_reward)
+        // Calculate the reward amount: current global cumulative reward - cumulative reward at stake time
+        let reward_amount = pool.cumulative_reward_per_nft.checked_sub(stake_entry.skipped_reward)
             .ok_or(ErrorCode::RewardCalculationError)?; // Use a specific error for calculation issues
         require_gt!(reward_amount, 0, ErrorCode::NoRewardsToClaim);
 
@@ -278,15 +324,49 @@ pub mod nft_staking {
             reward_amount,
         )?;
 
-        // Update the stake entry's skipped_reward to the current pool's skipped_reward_per_nft.
+        // Update the stake entry's skipped_reward to the current pool's cumulative_reward_per_nft.
         // This ensures that future claims only account for new rewards accrued since this claim.
-        stake_entry.skipped_reward = pool.skipped_reward_per_nft;
+        stake_entry.skipped_reward = pool.cumulative_reward_per_nft;
 
         emit!(RewardClaimed {
             user: ctx.accounts.user.key(),
             nft_mint: stake_entry.nft_mint,
             amount: reward_amount,
         });
+
+        Ok(())
+    }
+
+    // --- ADMIN INSTRUCTIONS ---
+
+    /// Cho phép admin rút một lượng token cụ thể từ reward_vault.
+    pub fn admin_claim(ctx: Context<AdminClaim>, amount: u64) -> Result<()> {
+        let pool = &ctx.accounts.pool;
+        
+        // Chỉ admin mới có thể thực hiện giao dịch này
+        require_keys_eq!(ctx.accounts.admin.key(), pool.admin, ErrorCode::Unauthorized);
+        // Đảm bảo số lượng rút lớn hơn 0
+        require_gt!(amount, 0, ErrorCode::ZeroRewardAmount);
+
+        // Kiểm tra số dư trong vault
+        require_gte!(ctx.accounts.reward_vault.amount, amount, ErrorCode::InsufficientVaultBalance);
+
+        let seeds = &[
+            b"pool".as_ref(),
+            &[pool.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.reward_vault.to_account_info(),
+            to: ctx.accounts.admin_reward_token_account.to_account_info(),
+            authority: pool.to_account_info(),
+        };
+        anchor_spl::token_interface::transfer(
+            CpiContext::new_with_signer(cpi_program, cpi_accounts, signer),
+            amount,
+        )?;
 
         Ok(())
     }
@@ -319,11 +399,11 @@ pub fn update_skipped_reward(pool: &mut Pool) -> Result<()> {
         let staked_count = *pool.staked_counts.get(day as usize).unwrap_or(&0);
 
         if staked_count > 0 {
-            let skipped_reward_for_day = reward_today.checked_div(staked_count as u64)
+            let cumulative_reward_for_day = reward_today.checked_div(staked_count as u64)
                 .ok_or(ErrorCode::RewardCalculationError)?; // Handle division by zero
-            pool.skipped_reward_per_nft = pool
-                .skipped_reward_per_nft
-                .checked_add(skipped_reward_for_day)
+            pool.cumulative_reward_per_nft = pool
+                .cumulative_reward_per_nft
+                .checked_add(cumulative_reward_for_day)
                 .ok_or(ErrorCode::RewardCalculationError)?; // Handle overflow
         }
     }
@@ -408,6 +488,18 @@ pub struct Unstake<'info> {
     pub nft_vault: InterfaceAccount<'info, TokenAccount>,
     #[account(init_if_needed, payer = user, associated_token::mint = nft_mint, associated_token::authority = user)]
     pub user_nft_token_account: InterfaceAccount<'info, TokenAccount>,
+    // Accounts for claiming rewards
+    #[account(address = pool.reward_mint)] // Add constraint to ensure it's the correct reward mint
+    pub reward_mint: InterfaceAccount<'info, Mint>, 
+    #[account(
+        init_if_needed,
+        payer = user,
+        associated_token::mint = reward_mint, // Reference the reward_mint account
+        associated_token::authority = user
+    )]
+    pub user_reward_token_account: InterfaceAccount<'info, TokenAccount>,
+    #[account(mut, address = pool.reward_vault)] // Add reward_vault to unstake context
+    pub reward_vault: InterfaceAccount<'info, TokenAccount>,
     pub system_program: Program<'info, System>,
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -446,6 +538,27 @@ pub struct ClaimReward<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
+/// Cấu trúc tài khoản cho lệnh `admin_claim`.
+#[derive(Accounts)]
+pub struct AdminClaim<'info> {
+    /// Tài khoản Pool, chứa thông tin quản trị viên và vault.
+    #[account(mut, seeds = [b"pool"], bump = pool.bump, has_one = admin, has_one = reward_mint)]
+    pub pool: Account<'info, Pool>,
+    /// Tài khoản quản trị viên, phải là người ký.
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// Vault chứa token phần thưởng của pool.
+    #[account(mut, address = pool.reward_vault)]
+    pub reward_vault: InterfaceAccount<'info, TokenAccount>,
+    /// Mint của token phần thưởng, để kiểm tra tính hợp lệ.
+    pub reward_mint: InterfaceAccount<'info, Mint>,
+    /// Tài khoản token của quản trị viên nơi tiền sẽ được chuyển đến.
+    #[account(mut, associated_token::mint = reward_mint, associated_token::authority = admin)]
+    pub admin_reward_token_account: InterfaceAccount<'info, TokenAccount>,
+    /// Chương trình token để thực hiện chuyển khoản.
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
 
 // --- DATA STRUCTS ---
 
@@ -462,8 +575,8 @@ pub struct Pool {
     pub rewards_per_epoch: Vec<u64>,
     pub bump: u8,
     pub start_staking_timestamp: i64, // ✅ Thời điểm bắt đầu staking chính thức
-    pub skipped_reward_per_nft: u64, // ✅ Tổng phần thưởng bỏ lỡ mỗi NFT tính đến thời điểm cuối
-    pub last_update_calc_reward_nft_index: u64, // ✅ Ngày cuối cùng đã update skipped reward
+    pub cumulative_reward_per_nft: u64, // ✅ Tổng phần thưởng bỏ lỡ mỗi NFT tính đến thời điểm cuối - Renamed
+    pub last_update_calc_reward_nft_index: u64, // ✅ Ngày cuối cùng đã update cumulative reward
     pub staked_counts: Vec<u32> // nft staking/day
 }
 impl Pool {
@@ -481,7 +594,7 @@ impl Pool {
         + (4 + 8 * Self::MAX_EPOCHS) // rewards_per_epoch
         + 1  // bump
         + 8  // start_staking_timestamp
-        + 8  // skipped_reward_per_nft
+        + 8  // cumulative_reward_per_nft - Renamed
         + 8  // last_update_calc_reward_nft_index
         + (4 + 4 * Self::MAX_EPOCHS); // staked_counts - 4 bytes per u32
 }
@@ -490,8 +603,8 @@ pub struct NftStakeEntry {
     pub user: Pubkey,
     pub nft_mint: Pubkey,
     pub staked_at: i64,
-    pub last_claimed_epoch: u64, // This field might become less relevant with skipped_reward
-    pub skipped_reward: u64, // The skipped_reward_per_nft value when this NFT was staked/last claimed
+    pub last_claimed_epoch: u64, // This field might become less relevant with cumulative_reward
+    pub skipped_reward: u64, // The cumulative_reward_per_nft value when this NFT was staked/last claimed
     pub bump: u8,
 }
 impl NftStakeEntry {
@@ -510,6 +623,18 @@ pub struct RewardClaimed {
     pub user: Pubkey,
     pub nft_mint: Pubkey,
     pub amount: u64,
+}
+#[event]
+pub struct StakeEvent {
+    pub user: Pubkey,
+    pub nft_mint: Pubkey,
+    pub staked_at: i64,
+}
+#[event]
+pub struct UnstakeEvent {
+    pub user: Pubkey,
+    pub nft_mint: Pubkey,
+    pub unstaked_at: i64,
 }
 #[error_code]
 pub enum ErrorCode {
@@ -535,4 +660,6 @@ pub enum ErrorCode {
     MaxCollectionsExceeded, // New error code
     #[msg("An error occurred during reward calculation (e.g., overflow, underflow, division by zero).")]
     RewardCalculationError, // New error code for math operations
+    #[msg("Insufficient balance in the vault to perform this operation.")]
+    InsufficientVaultBalance, // New error code for insufficient funds
 }
