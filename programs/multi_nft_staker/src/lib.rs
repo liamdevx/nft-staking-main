@@ -74,8 +74,53 @@ pub mod nft_staking {
         Ok(())
     }
 
+    // add reward for today
+    pub fn add_reward_for_today(
+        ctx: Context<AddReward>,
+        amount: u64,
+    ) -> Result<()> {
+        require_gt!(amount, 0, ErrorCode::ZeroRewardAmount);
+    
+        // Transfer reward token vào vault như bình thường
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.admin_reward_token_account.to_account_info(),
+            to: ctx.accounts.reward_vault.to_account_info(),
+            authority: ctx.accounts.admin.to_account_info(),
+        };
+        anchor_spl::token_interface::transfer(
+            CpiContext::new(cpi_program, cpi_accounts),
+            amount,
+        )?;
+    
+        let pool = &mut ctx.accounts.pool;
+        let current_day = get_current_day(pool)?;
+    
+        // Nếu mảng chưa đủ dài tới current_day, mở rộng bằng 0
+        if pool.rewards_per_epoch.len() <= current_day as usize {
+            pool.rewards_per_epoch
+                .resize(current_day as usize + 1, 0);
+        }
+    
+        // Cộng dồn reward cho ngày hiện tại
+        pool.rewards_per_epoch[current_day as usize] = pool.rewards_per_epoch[current_day as usize]
+            .checked_add(amount)
+            .ok_or(ErrorCode::RewardCalculationError)?;
+    
+        emit!(RewardAdded {
+            funder: ctx.accounts.admin.key(),
+            total_amount: amount,
+            epochs_funded: 1,
+        });
+    
+        Ok(())
+    }
+    
+
     pub fn add_collection(ctx: Context<ManageCollection>, collection_mint: Pubkey) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
+        // only admin
+        require_keys_eq!(ctx.accounts.admin.key(), pool.admin, ErrorCode::Unauthorized);
         require!(
             !pool.allowed_collections.contains(&collection_mint),
             ErrorCode::CollectionAlreadyAllowed
@@ -93,6 +138,7 @@ pub mod nft_staking {
         collection_mint: Pubkey,
     ) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
+        require_keys_eq!(ctx.accounts.admin.key(), pool.admin, ErrorCode::Unauthorized);
         let initial_len = pool.allowed_collections.len();
         pool.allowed_collections
             .retain(|&mint| mint != collection_mint);
