@@ -31,7 +31,9 @@ pub mod nft_staking {
         pool.start_staking_timestamp = Clock::get()?.unix_timestamp;
         pool.cumulative_reward_per_nft = 0; // Renamed
         pool.last_update_calc_reward_nft_index = 0; 
-        pool.staked_counts = vec![0; Pool::MAX_EPOCHS]; // Initialize with zeros up to MAX_EPOCHS
+        pool.staked_counts = Vec::new(); // Initialize as empty
+        pool.staked_counts_start_day = 0; // New field initialization
+        pool.total_staked_at_window_start = 0; // New field initialization
         Ok(())
     }
 
@@ -187,12 +189,23 @@ pub mod nft_staking {
         stake_entry.skipped_reward = pool.cumulative_reward_per_nft; // Record current global cumulative reward
 
         pool.total_staked = pool.total_staked.checked_add(1).unwrap();
+        
         let current_day = get_current_day(&pool)?;
-        // Ensure staked_counts has enough capacity
-        if (current_day as usize) >= pool.staked_counts.len() {
-             pool.staked_counts.resize((current_day as usize) + 1, 0);
+        let index_for_current_day = current_day.checked_sub(pool.staked_counts_start_day)
+                                            .ok_or(ErrorCode::RewardCalculationError)?;
+
+        require!(
+            (index_for_current_day as usize) < Pool::MAX_STAKED_COUNTS_WINDOW_DAYS,
+            ErrorCode::MaxStakedCountsExceeded
+        );
+
+        // Ensure staked_counts has enough capacity for the current day's index.
+        // New elements will be 0, which is fine as update_skipped_reward handles the propagation.
+        if (index_for_current_day as usize) >= pool.staked_counts.len() {
+            pool.staked_counts.resize((index_for_current_day as usize) + 1, 0);
         }
-        pool.staked_counts[current_day as usize] = pool.staked_counts[current_day as usize].checked_add(1).unwrap();
+        // Set the current day's entry to the *actual new total_staked* after this transaction.
+        pool.staked_counts[index_for_current_day as usize] = pool.total_staked as u32; // Store the snapshot
 
         // Emit StakeEvent
         emit!(StakeEvent {
@@ -277,11 +290,22 @@ pub mod nft_staking {
         ))?;
 
         pool.total_staked = pool.total_staked.checked_sub(1).unwrap();
+        
         let current_day = get_current_day(&pool)?;
-        // Ensure staked_counts has enough capacity
-        if (current_day as usize) < pool.staked_counts.len() {
-            pool.staked_counts[current_day as usize] = pool.staked_counts[current_day as usize].checked_sub(1).unwrap_or(0);
+        let index_for_current_day = current_day.checked_sub(pool.staked_counts_start_day)
+                                            .ok_or(ErrorCode::RewardCalculationError)?;
+        require!(
+            (index_for_current_day as usize) < Pool::MAX_STAKED_COUNTS_WINDOW_DAYS,
+            ErrorCode::MaxStakedCountsExceeded
+        );
+        
+        // Ensure staked_counts has enough capacity for the current day's index.
+        // New elements will be 0, which is fine as update_skipped_reward handles the propagation.
+        if (index_for_current_day as usize) >= pool.staked_counts.len() {
+            pool.staked_counts.resize((index_for_current_day as usize) + 1, 0);
         }
+        // Set the current day's entry to the *actual new total_staked* after this transaction.
+        pool.staked_counts[index_for_current_day as usize] = pool.total_staked as u32; // Store the snapshot
         
         // Emit UnstakeEvent
         emit!(UnstakeEvent {
@@ -388,28 +412,61 @@ fn get_current_day(pool: &Pool) -> Result<u64> {
 pub fn update_skipped_reward(pool: &mut Pool) -> Result<()> {
     let current_day = get_current_day(pool)?;
 
-    // Only update if there are new days to process
+    // Không cần cập nhật nếu không có ngày mới
     if pool.last_update_calc_reward_nft_index >= current_day {
         return Ok(());
     }
 
-    for day in pool.last_update_calc_reward_nft_index..current_day {
-        // Ensure we don't go out of bounds for rewards_per_epoch or staked_counts
-        let reward_today = *pool.rewards_per_epoch.get(day as usize).unwrap_or(&0);
-        let staked_count = *pool.staked_counts.get(day as usize).unwrap_or(&0);
+    // Khởi tạo với tổng số stake tại thời điểm bắt đầu cửa sổ hiện tại
+    let mut last_valid_staked_count = pool.total_staked_at_window_start; 
 
-        if staked_count > 0 {
-            let cumulative_reward_for_day = reward_today.checked_div(staked_count as u64)
-                .ok_or(ErrorCode::RewardCalculationError)?; // Handle division by zero
+    for day in pool.last_update_calc_reward_nft_index..current_day {
+        let index_in_staked_counts = day
+            .checked_sub(pool.staked_counts_start_day)
+            .ok_or(ErrorCode::RewardCalculationError)?;
+
+        // Lấy phần thưởng trong ngày đó
+        let reward_today = *pool.rewards_per_epoch.get(day as usize).unwrap_or(&0);
+
+        // Lấy số lượng stake trong ngày từ snapshot.
+        // Nếu index hợp lệ và có giá trị trong staked_counts, sử dụng nó.
+        // Ngược lại, tiếp tục sử dụng last_valid_staked_count từ ngày trước đó.
+        let staked_count_snapshot = if (index_in_staked_counts as usize) < pool.staked_counts.len() {
+            *pool.staked_counts.get(index_in_staked_counts as usize).unwrap() as u64
+        } else {
+            // Nếu chỉ mục nằm ngoài phạm vi của staked_counts hiện tại,
+            // điều đó có nghĩa là không có giao dịch stake/unstake rõ ràng
+            // vào ngày này trong cửa sổ hiện tại.
+            // Trong trường hợp này, chúng ta sử dụng giá trị `last_valid_staked_count`
+            // từ ngày gần nhất có giá trị hợp lệ (hoặc từ `total_staked_at_window_start`).
+            last_valid_staked_count 
+        };
+
+        // Nếu snapshot cho ngày này khác 0, cập nhật last_valid_staked_count.
+        // Điều này đảm bảo rằng chúng ta luôn sử dụng giá trị stake gần nhất có hoạt động.
+        if staked_count_snapshot > 0 {
+            last_valid_staked_count = staked_count_snapshot;
+        }
+
+        // Chỉ cộng reward nếu có last_valid_staked_count (tránh chia 0)
+        if last_valid_staked_count > 0 {
+            let cumulative_reward_for_day = reward_today
+                .checked_div(last_valid_staked_count)
+                .ok_or(ErrorCode::RewardCalculationError)?;
+
             pool.cumulative_reward_per_nft = pool
                 .cumulative_reward_per_nft
                 .checked_add(cumulative_reward_for_day)
-                .ok_or(ErrorCode::RewardCalculationError)?; // Handle overflow
+                .ok_or(ErrorCode::RewardCalculationError)?;
         }
     }
 
+    // Sau khi tính xong, clear dữ liệu staked cũ
+    pool.staked_counts.clear();
+    pool.staked_counts_start_day = current_day;
     pool.last_update_calc_reward_nft_index = current_day;
-
+    // Cập nhật total_staked_at_window_start cho cửa sổ tiếp theo
+    pool.total_staked_at_window_start = pool.total_staked; 
     Ok(())
 }
 
@@ -487,7 +544,7 @@ pub struct Unstake<'info> {
     #[account(mut, seeds = [b"nft_vault", user.key().as_ref(), nft_mint.key().as_ref()], bump)]
     pub nft_vault: InterfaceAccount<'info, TokenAccount>,
     #[account(init_if_needed, payer = user, associated_token::mint = nft_mint, associated_token::authority = user)]
-    pub user_nft_token_account: InterfaceAccount<'info, TokenAccount>,
+    pub user_nft_token_account: InterfaceAccount<'info, TokenAccount>, // Changed from Interface to InterfaceAccount
     // Accounts for claiming rewards
     #[account(address = pool.reward_mint)] // Add constraint to ensure it's the correct reward mint
     pub reward_mint: InterfaceAccount<'info, Mint>, 
@@ -577,11 +634,14 @@ pub struct Pool {
     pub start_staking_timestamp: i64, // ✅ Thời điểm bắt đầu staking chính thức
     pub cumulative_reward_per_nft: u64, // ✅ Tổng phần thưởng bỏ lỡ mỗi NFT tính đến thời điểm cuối - Renamed
     pub last_update_calc_reward_nft_index: u64, // ✅ Ngày cuối cùng đã update cumulative reward
-    pub staked_counts: Vec<u32> // nft staking/day
+    pub staked_counts: Vec<u32>, // Store snapshot of total staked for each day in the window
+    pub staked_counts_start_day: u64, // The day corresponding to staked_counts[0]
+    pub total_staked_at_window_start: u64, // The total_staked value at the day staked_counts_start_day represents
 }
 impl Pool {
     pub const MAX_EPOCHS: usize = 1200;
     pub const MAX_COLLECTIONS: usize = 2; // Increased to 2 for example
+    pub const MAX_STAKED_COUNTS_WINDOW_DAYS: usize = 365; // Max days to store in staked_counts vector
     pub const ACCOUNT_SPACE: usize = 8
         + 32 // admin
         + 32 // reward_mint
@@ -594,9 +654,11 @@ impl Pool {
         + (4 + 8 * Self::MAX_EPOCHS) // rewards_per_epoch
         + 1  // bump
         + 8  // start_staking_timestamp
-        + 8  // cumulative_reward_per_nft - Renamed
+        + 8  // cumulative_reward_per_nft
         + 8  // last_update_calc_reward_nft_index
-        + (4 + 4 * Self::MAX_EPOCHS); // staked_counts - 4 bytes per u32
+        + 8  // staked_counts_start_day
+        + 8  // total_staked_at_window_start (new field)
+        + (4 + 4 * Self::MAX_STAKED_COUNTS_WINDOW_DAYS); // staked_counts - 4 bytes per u32, using new max window
 }
 #[account]
 pub struct NftStakeEntry {
@@ -662,4 +724,6 @@ pub enum ErrorCode {
     RewardCalculationError, // New error code for math operations
     #[msg("Insufficient balance in the vault to perform this operation.")]
     InsufficientVaultBalance, // New error code for insufficient funds
+    #[msg("Staked counts window exceeded maximum capacity. Please update rewards more frequently.")]
+    MaxStakedCountsExceeded, // New error code for staked_counts window
 }
